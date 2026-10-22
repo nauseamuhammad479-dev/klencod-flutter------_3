@@ -1,0 +1,752 @@
+import 'dart:convert';
+
+import 'package:flutter/material.dart';
+import 'package:sqflite/sqflite.dart';
+import 'package:path/path.dart' as path;
+import 'package:http/http.dart' as http;
+import 'package:file_picker/file_picker.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await NovaDatabase.instance.init();
+  runApp(const NovaApp());
+}
+
+const gold = Color(0xFFD6B56D);
+const dark = Color(0xFF090A0D);
+const panel = Color(0xFF171A21);
+
+class NovaApp extends StatelessWidget {
+  const NovaApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'NOVA AI',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: dark,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: gold,
+          brightness: Brightness.dark,
+        ),
+        appBarTheme: const AppBarTheme(
+          backgroundColor: dark,
+          foregroundColor: gold,
+        ),
+        inputDecorationTheme: InputDecorationTheme(
+          filled: true,
+          fillColor: panel,
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(14),
+          ),
+        ),
+      ),
+      home: const Directionality(
+        textDirection: TextDirection.rtl,
+        child: NovaHome(),
+      ),
+    );
+  }
+}
+
+// ==================== DATABASE ====================
+
+class NovaDatabase {
+  NovaDatabase._();
+
+  static final instance = NovaDatabase._();
+  Database? _database;
+
+  Future<void> init() async {
+    final dbPath = await getDatabasesPath();
+
+    _database = await openDatabase(
+      path.join(dbPath, 'nova_ai.db'),
+      version: 1,
+      onCreate: (db, version) async {
+        await db.execute('''
+          CREATE TABLE knowledge (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            source TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          )
+        ''');
+      },
+    );
+  }
+
+  Database get db {
+    if (_database == null) {
+      throw StateError('قاعدة البيانات لم تبدأ بعد');
+    }
+    return _database!;
+  }
+
+  Future<void> addKnowledge(
+    String title,
+    String content, {
+    String source = 'تدريب تفاعلي',
+  }) async {
+    if (content.trim().isEmpty) return;
+
+    await db.insert('knowledge', {
+      'title': title.trim().isEmpty ? 'معلومة جديدة' : title.trim(),
+      'content': content.trim(),
+      'source': source,
+      'created_at': DateTime.now().toIso8601String(),
+    });
+  }
+
+  Future<List<Map<String, Object?>>> getAll() {
+    return db.query('knowledge', orderBy: 'id DESC');
+  }
+
+  Future<List<Map<String, Object?>>> search(String query) async {
+    final all = await getAll();
+
+    final terms = query
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^\p{L}\p{N}\s]', unicode: true), ' ')
+        .split(RegExp(r'\s+'))
+        .where((word) => word.length > 1)
+        .toSet();
+
+    if (terms.isEmpty) return [];
+
+    final scored = <({Map<String, Object?> item, int score})>[];
+
+    for (final item in all) {
+      final text =
+          '${item['title']} ${item['content']}'.toLowerCase();
+
+      int score = 0;
+
+      for (final term in terms) {
+        if (text.contains(term)) score++;
+      }
+
+      if (score > 0) {
+        scored.add((item: item, score: score));
+      }
+    }
+
+    scored.sort((a, b) => b.score.compareTo(a.score));
+
+    return scored.take(5).map((e) => e.item).toList();
+  }
+
+  Future<void> deleteKnowledge(int id) async {
+    await db.delete(
+      'knowledge',
+      where: 'id = ?',
+      whereArgs: [id],
+    );
+  }
+}
+
+// ==================== INTERNET SEARCH ====================
+
+class WebResult {
+  final String title;
+  final String snippet;
+  final String url;
+
+  const WebResult({
+    required this.title,
+    required this.snippet,
+    required this.url,
+  });
+}
+
+class NovaWebSearch {
+  Future<List<WebResult>> search(String question) async {
+    final uri = Uri.https(
+      'ar.wikipedia.org',
+      '/w/api.php',
+      {
+        'action': 'query',
+        'list': 'search',
+        'srsearch': question,
+        'format': 'json',
+        'utf8': '1',
+        'srlimit': '5',
+      },
+    );
+
+    final response = await http
+        .get(uri, headers: {
+          'User-Agent': 'NOVA-AI/1.0',
+        })
+        .timeout(const Duration(seconds: 15));
+
+    if (response.statusCode != 200) {
+      throw Exception('البحث غير متاح حاليًا');
+    }
+
+    final json = jsonDecode(response.body)
+        as Map<String, dynamic>;
+
+    final query = json['query'] as Map<String, dynamic>?;
+    final rows = query?['search'] as List<dynamic>? ?? [];
+
+    return rows.map((row) {
+      final item = row as Map<String, dynamic>;
+      final title = item['title'] as String? ?? 'بدون عنوان';
+
+      final snippet = (item['snippet'] as String? ?? '')
+          .replaceAll(RegExp(r'<[^>]*>'), '')
+          .replaceAll('&quot;', '"')
+          .replaceAll('&amp;', '&')
+          .replaceAll('&#039;', "'");
+
+      return WebResult(
+        title: title,
+        snippet: snippet,
+        url:
+            'https://ar.wikipedia.org/wiki/${Uri.encodeComponent(title.replaceAll(' ', '_'))}',
+      );
+    }).toList();
+  }
+}
+
+// ==================== MAIN SCREEN ====================
+
+class NovaHome extends StatefulWidget {
+  const NovaHome({super.key});
+
+  @override
+  State<NovaHome> createState() => _NovaHomeState();
+}
+
+class _NovaHomeState extends State<NovaHome> {
+  int tab = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Row(
+          children: [
+            Icon(Icons.auto_awesome, color: gold),
+            SizedBox(width: 10),
+            Text(
+              'NOVA AI',
+              style: TextStyle(fontWeight: FontWeight.bold),
+            ),
+          ],
+        ),
+      ),
+      body: IndexedStack(
+        index: tab,
+        children: const [
+          ChatPage(),
+          TrainingPage(),
+          MemoryPage(),
+        ],
+      ),
+      bottomNavigationBar: NavigationBar(
+        backgroundColor: panel,
+        indicatorColor: gold.withOpacity(0.18),
+        selectedIndex: tab,
+        onDestinationSelected: (index) {
+          setState(() => tab = index);
+        },
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.chat_outlined),
+            selectedIcon: Icon(Icons.chat),
+            label: 'المحادثة',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.school_outlined),
+            selectedIcon: Icon(Icons.school),
+            label: 'التدريب التفاعلي',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.storage_outlined),
+            selectedIcon: Icon(Icons.storage),
+            label: 'الذاكرة',
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ==================== CHAT ====================
+
+class ChatPage extends StatefulWidget {
+  const ChatPage({super.key});
+
+  @override
+  State<ChatPage> createState() => _ChatPageState();
+}
+
+class _ChatPageState extends State<ChatPage> {
+  final controller = TextEditingController();
+  final scrollController = ScrollController();
+  final webSearch = NovaWebSearch();
+
+  final List<Map<String, String>> messages = [
+    {
+      'role': 'ai',
+      'text':
+          'أهلًا بيك في NOVA AI!\n'
+          'تقدر تضيف معلوماتك وتدربني من تبويب "التدريب التفاعلي"، '
+          'وأنا أبحث في الذاكرة والإنترنت للإجابة.',
+    },
+  ];
+
+  bool busy = false;
+  bool useInternet = true;
+
+  Future<String> answer(String question) async {
+    final results =
+        await NovaDatabase.instance.search(question);
+
+    final output = <String>[];
+
+    if (results.isNotEmpty) {
+      output.add('📚 معلومات من ذاكرتي:\n');
+
+      for (final item in results) {
+        output.add(
+          '• ${item['title']}\n${item['content']}',
+        );
+      }
+    }
+
+    if (useInternet) {
+      try {
+        final web = await webSearch.search(question);
+
+        if (web.isNotEmpty) {
+          output.add('\n🌐 نتائج البحث على الإنترنت:\n');
+
+          for (final result in web) {
+            output.add(
+              '• ${result.title}\n'
+              '${result.snippet}\n'
+              'المصدر: ${result.url}',
+            );
+          }
+        }
+      } catch (_) {
+        output.add(
+          '\nتعذر الاتصال بالإنترنت. '
+          'يمكنك المحاولة مرة أخرى.',
+        );
+      }
+    }
+
+    if (output.isEmpty) {
+      return 'لم أجد معلومات كافية للإجابة عن سؤالك.\n'
+          'توجه إلى غرفة التدريب التفاعلي وعلمني إياها أو حاول البحث مجددًا.';
+    }
+
+    output.add(
+      '\nتنبيه: النسخة الحالية تسترجع المعلومات '
+      'وتبحث على الإنترنت، ولم يتم توصيل نموذج لغوي '
+      'محلي بها بعد.',
+    );
+
+    return output.join('\n\n');
+  }
+
+  Future<void> send() async {
+    final question = controller.text.trim();
+
+    if (question.isEmpty || busy) return;
+
+    controller.clear();
+
+    setState(() {
+      messages.add({
+        'role': 'user',
+        'text': question,
+      });
+      busy = true;
+    });
+
+    try {
+      final response = await answer(question);
+
+      if (!mounted) return;
+
+      setState(() {
+        messages.add({
+          'role': 'ai',
+          'text': response,
+        });
+      });
+    } catch (error) {
+      if (!mounted) return;
+
+      setState(() {
+        messages.add({
+          'role': 'ai',
+          'text': 'حدث خطأ: $error',
+        });
+      });
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    controller.dispose();
+    scrollController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        SwitchListTile(
+          value: useInternet,
+          activeColor: gold,
+          title: const Text('البحث على الإنترنت'),
+          subtitle: const Text('البحث عبر ويكيبيديا العربية'),
+          onChanged: (value) {
+            setState(() => useInternet = value);
+          },
+        ),
+        Expanded(
+          child: ListView.builder(
+            controller: scrollController,
+            padding: const EdgeInsets.all(12),
+            itemCount: messages.length + (busy ? 1 : 0),
+            itemBuilder: (context, index) {
+              if (busy && index == messages.length) {
+                return const Padding(
+                  padding: EdgeInsets.all(16),
+                  child: Align(
+                    alignment: Alignment.centerRight,
+                    child: CircularProgressIndicator(
+                      color: gold,
+                    ),
+                  ),
+                );
+              }
+
+              final message = messages[index];
+              final isUser = message['role'] == 'user';
+
+              return Align(
+                alignment: isUser
+                    ? Alignment.centerRight
+                    : Alignment.centerLeft,
+                child: Container(
+                  width: double.infinity,
+                  margin: const EdgeInsets.symmetric(vertical: 5),
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: isUser
+                        ? const Color(0xFF292D36)
+                        : panel,
+                    borderRadius: BorderRadius.circular(15),
+                    border: Border.all(
+                      color: isUser
+                          ? Colors.white12
+                          : gold.withOpacity(0.25),
+                    ),
+                  ),
+                  child: SelectableText(
+                    message['text'] ?? '',
+                    style: const TextStyle(height: 1.6),
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+        SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.all(10),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: controller,
+                    minLines: 1,
+                    maxLines: 4,
+                    onSubmitted: (_) => send(),
+                    decoration: const InputDecoration(
+                      hintText: 'اسأل NOVA AI...',
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton.filled(
+                  onPressed: busy ? null : send,
+                  style: IconButton.styleFrom(
+                    backgroundColor: gold,
+                    foregroundColor: Colors.black,
+                  ),
+                  icon: const Icon(Icons.send),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ==================== TRAINING ROOM (Interactive Chat) ====================
+
+class TrainingPage extends StatefulWidget {
+  const TrainingPage({super.key});
+
+  @override
+  State<TrainingPage> createState() => _TrainingPageState();
+}
+
+class _TrainingPageState extends State<TrainingPage> {
+  final controller = TextEditingController();
+  final scrollController = ScrollController();
+  
+  final List<Map<String, String>> trainingMessages = [
+    {
+      'role': 'ai',
+      'text': 'أهلاً بك في غرفة التدريب التفاعلية! 🧠\n'
+          'تحدث معي الآن وعلمني أي معلومة، قاعدة، أو توجيه تريده. '
+          'كل ما تكتبه هنا سيتم حفظه تلقائياً في ذاكرتي لأستطيع تذكره والإجابة بناءً عليه في قسم المحادثة.',
+    },
+  ];
+  
+  bool busy = false;
+
+  Future<void> sendTraining() async {
+    final text = controller.text.trim();
+    if (text.isEmpty || busy) return;
+
+    controller.clear();
+
+    setState(() {
+      trainingMessages.add({
+        'role': 'user',
+        'text': text,
+      });
+      busy = true;
+    });
+
+    try {
+      // استخراج عنوان قصير من النص المحفوظ
+      final title = text.length > 30 ? '${text.substring(0, 30)}...' : text;
+      
+      // حفظ التدريب تلقائياً في قاعدة البيانات
+      await NovaDatabase.instance.addKnowledge(
+        title,
+        text,
+        source: 'محادثة التدريب التفاعلي',
+      );
+
+      if (!mounted) return;
+
+      setState(() {
+        trainingMessages.add({
+          'role': 'ai',
+          'text': '✅ رائع! لقد استوعبت المعلومة وحفظتها في الذاكرة بنجاح.\n'
+              'هل لديك معلومة أخرى تريد تعليمي إياها؟',
+        });
+      });
+    } catch (error) {
+      if (!mounted) return;
+
+      setState(() {
+        trainingMessages.add({
+          'role': 'ai',
+          'text': '⚠️ حدث خطأ أثناء الحفظ: $error',
+        });
+      });
+    } finally {
+      if (mounted) {
+        setState(() => busy = false);
+        // التمرير التلقائي لأسفل المحادثة
+        Future.delayed(const Duration(milliseconds: 100), () {
+          if (scrollController.hasClients) {
+            scrollController.animateTo(
+              scrollController.position.maxScrollExtent,
+              duration: const Duration(milliseconds: 300),
+              curve: Curves.easeOut,
+            );
+          }
+        });
+      }
+    }
+  }
+
+  Future<void> importFile() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['txt', 'md'],
+      withData: true,
+    );
+
+    if (result == null || result.files.isEmpty) return;
+
+    final file = result.files.single;
+    final bytes = file.bytes;
+
+    if (bytes == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('تعذر قراءة الملف')),
+      );
+      return;
+    }
+
+    final content = utf8.decode(bytes, allowMalformed: true);
+
+    await NovaDatabase.instance.addKnowledge(
+      file.name,
+      content,
+      source: 'ملف: ${file.name}',
+    );
+
+    setState(() {
+      trainingMessages.add({
+        'role': 'ai',
+        'text': '📂 تم استيراد الملف "${file.name}" وحفظ محتواه في الذاكرة بنجاح!',
+      });
+    });
+  }
+
+  @override
+  void dispose() {
+    controller.dispose();
+    scrollController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          color: panel,
+          child: Row(
+            children: [
+              const Icon(Icons.psychology_alt, color: gold),
+              const SizedBox(width: 8),
+              const Expanded(
+                child: Text(
+                  'التدريب المباشر (تحدث وعلمني)',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+              ),
+              IconButton(
+                icon: const Icon(Icons.upload_file, color: gold),
+                tooltip: 'استيراد ملف TXT أو MD',
+                onPressed: importFile,
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: ListView.builder(
+            controller: scrollController,
+            padding: const EdgeInsets.all(12),
+            itemCount: trainingMessages.length + (busy ? 1 : 0),
+            itemBuilder: (context, index) {
+              if (busy && index == trainingMessages.length) {
+                return const Padding(
+                  padding: EdgeInsets.all(16),
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: CircularProgressIndicator(
+                      color: gold,
+                    ),
+                  ),
+                );
+              }
+
+              if (index >= trainingMessages.length) return const SizedBox.shrink();
+
+              final message = trainingMessages[index];
+              final isUser = message['role'] == 'user';
+
+              return Align(
+                alignment: isUser
+                    ? Alignment.centerRight
+                    : Alignment.centerLeft,
+                child: Container(
+                  width: double.infinity,
+                  margin: const EdgeInsets.symmetric(vertical: 5),
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: isUser
+                        ? const Color(0xFF292D36)
+                        : panel,
+                    borderRadius: BorderRadius.circular(15),
+                    border: Border.all(
+                      color: isUser
+                          ? Colors.white12
+                          : gold.withOpacity(0.25),
+                    ),
+                  ),
+                  child: SelectableText(
+                    message['text'] ?? '',
+                    style: const TextStyle(height: 1.6),
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+        SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.all(10),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: controller,
+                    minLines: 1,
+                    maxLines: 4,
+                    onSubmitted: (_) => sendTraining(),
+                    decoration: const InputDecoration(
+                      hintText: 'اكتب معلومة لتدريب NOVA AI...',
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton.filled(
+                  onPressed: busy ? null : sendTraining,
+                  style: IconButton.styleFrom(
+                    backgroundColor: gold,
+                    foregroundColor: Colors.black,
+                  ),
+                  icon: const Icon(Icons.send),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ==================== KNOWLEDGE MEMORY ====================
+
+class MemoryPage extends StatefulWidget {
+  const MemoryPage({super.key});
+
+  @override
+  State<MemoryPage> createState() => _MemoryPageState();
+}
+
+class _MemoryPageState extends State<MemoryPage> {
+  final searchController = TextEditingController();
+ 
